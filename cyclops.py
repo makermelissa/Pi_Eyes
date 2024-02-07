@@ -39,8 +39,8 @@ AUTOBLINK       = True  # If True, eye blinks autonomously
 # GPIO initialization ------------------------------------------------------
 
 if BLINK_PIN is not None:
-	BLINK_PIN = digitalio.DigitalInOut(BLINK_PIN)
-	BLINK_PIN.switch_to_input(pull=digitalio.Pull.UP)
+    BLINK_PIN = digitalio.DigitalInOut(BLINK_PIN)
+    BLINK_PIN.switch_to_input(pull=digitalio.Pull.UP)
 
 # ADC stuff ----------------------------------------------------------------
 
@@ -48,11 +48,11 @@ if BLINK_PIN is not None:
 # from blocking operations. The animation loop can read at its leisure.
 
 if JOYSTICK_X_IN >= 0 or JOYSTICK_Y_IN >= 0 or PUPIL_IN >= 0:
-	bonnet = SnakeEyesBonnet(daemon=True)
-	bonnet.setup_channel(JOYSTICK_X_IN, reverse=JOYSTICK_X_FLIP)
-	bonnet.setup_channel(JOYSTICK_Y_IN, reverse=JOYSTICK_Y_FLIP)
-	bonnet.setup_channel(PUPIL_IN, reverse=PUPIL_IN_FLIP)
-	bonnet.start()
+    bonnet = SnakeEyesBonnet(daemon=True)
+    bonnet.setup_channel(JOYSTICK_X_IN, reverse=JOYSTICK_X_FLIP)
+    bonnet.setup_channel(JOYSTICK_Y_IN, reverse=JOYSTICK_Y_FLIP)
+    bonnet.setup_channel(PUPIL_IN, reverse=PUPIL_IN_FLIP)
+    bonnet.start()
 
 
 # Load SVG file, extract paths & convert to point lists --------------------
@@ -83,10 +83,10 @@ DISPLAY.set_background(0, 0, 0, 1) # r,g,b,alpha
 
 # eyeRadius is the size, in pixels, at which the whole eye will be rendered.
 if DISPLAY.width <= (DISPLAY.height * 2):
-	# For WorldEye, eye size is -almost- full screen height
-	eyeRadius   = DISPLAY.height / 2.1
+    # For WorldEye, eye size is -almost- full screen height
+    eyeRadius   = DISPLAY.height / 2.1
 else:
-	eyeRadius   = DISPLAY.height * 2 / 5
+    eyeRadius   = DISPLAY.height * 2 / 5
 
 # A 2D camera is used, mostly to allow for pixel-accurate eye placement,
 # but also because perspective isn't really helpful or needed here, and
@@ -192,8 +192,8 @@ ca, sa = pi3d.Utility.from_polar((90 - angle1) + aRange * 0.0001)
 pts.append((ca * eyeRadius, sa * eyeRadius))
 
 for i in range(24):
-	ca, sa = pi3d.Utility.from_polar((90 - angle1) - aRange * i / 23)
-	pts.append((ca * eyeRadius, sa * eyeRadius))
+    ca, sa = pi3d.Utility.from_polar((90 - angle1) - aRange * i / 23)
+    pts.append((ca * eyeRadius, sa * eyeRadius))
 
 eye = pi3d.Lathe(path=pts, sides=64)
 eye.set_textures([scleraMap])
@@ -248,182 +248,182 @@ trackingPos = 0.3
 # Generate one frame of imagery
 def frame(p):
 
-	global startX, startY, destX, destY, curX, curY
-	global moveDuration, holdDuration, startTime, isMoving
-	global frames
-	global iris
-	global pupilMinPts, pupilMaxPts, irisPts, irisZ
-	global eye
-	global upperEyelid, lowerEyelid
-	global upperLidOpenPts, upperLidClosedPts, lowerLidOpenPts, lowerLidClosedPts
-	global upperLidEdgePts, lowerLidEdgePts
-	global prevUpperLidPts, prevLowerLidPts
-	global prevUpperLidWeight, prevLowerLidWeight
-	global prevPupilScale
-	global irisRegenThreshold, upperLidRegenThreshold, lowerLidRegenThreshold
-	global luRegen, llRegen, ruRegen, rlRegen
-	global timeOfLastBlink, timeToNextBlink
-	global blinkState
-	global blinkDuration
-	global blinkStartTime
-	global trackingPos
+    global startX, startY, destX, destY, curX, curY
+    global moveDuration, holdDuration, startTime, isMoving
+    global frames
+    global iris
+    global pupilMinPts, pupilMaxPts, irisPts, irisZ
+    global eye
+    global upperEyelid, lowerEyelid
+    global upperLidOpenPts, upperLidClosedPts, lowerLidOpenPts, lowerLidClosedPts
+    global upperLidEdgePts, lowerLidEdgePts
+    global prevUpperLidPts, prevLowerLidPts
+    global prevUpperLidWeight, prevLowerLidWeight
+    global prevPupilScale
+    global irisRegenThreshold, upperLidRegenThreshold, lowerLidRegenThreshold
+    global luRegen, llRegen, ruRegen, rlRegen
+    global timeOfLastBlink, timeToNextBlink
+    global blinkState
+    global blinkDuration
+    global blinkStartTime
+    global trackingPos
 
-	DISPLAY.loop_running()
+    DISPLAY.loop_running()
 
-	now = time.time()
-	dt  = now - startTime
+    now = time.time()
+    dt  = now - startTime
 
-	frames += 1
-#	if(now > beginningTime):
-#		print(frames/(now-beginningTime))
+    frames += 1
+#    if(now > beginningTime):
+#        print(frames/(now-beginningTime))
 
-	if JOYSTICK_X_IN >= 0 and JOYSTICK_Y_IN >= 0:
-		# Eye position from analog inputs
-		curX = bonnet.channel[JOYSTICK_X_IN].value
-		curY = bonnet.channel[JOYSTICK_Y_IN].value
-		curX = -30.0 + curX * 60.0
-		curY = -30.0 + curY * 60.0
-	else :
-		# Autonomous eye position
-		if isMoving == True:
-			if dt <= moveDuration:
-				scale        = (now - startTime) / moveDuration
-				# Ease in/out curve: 3*t^2-2*t^3
-				scale = 3.0 * scale * scale - 2.0 * scale * scale * scale
-				curX         = startX + (destX - startX) * scale
-				curY         = startY + (destY - startY) * scale
-			else:
-				startX       = destX
-				startY       = destY
-				curX         = destX
-				curY         = destY
-				holdDuration = random.uniform(0.15, 1.7)
-				startTime    = now
-				isMoving     = False
-		else:
-			if dt >= holdDuration:
-				destX        = random.uniform(-30.0, 30.0)
-				n            = math.sqrt(900.0 - destX * destX)
-				destY        = random.uniform(-n, n)
-				# Movement is slower in this version because
-				# the WorldEye display is big and the eye
-				# should have some 'mass' to it.
-				moveDuration = random.uniform(0.12, 0.35)
-				startTime    = now
-				isMoving     = True
+    if JOYSTICK_X_IN >= 0 and JOYSTICK_Y_IN >= 0:
+        # Eye position from analog inputs
+        curX = bonnet.channel[JOYSTICK_X_IN].value
+        curY = bonnet.channel[JOYSTICK_Y_IN].value
+        curX = -30.0 + curX * 60.0
+        curY = -30.0 + curY * 60.0
+    else :
+        # Autonomous eye position
+        if isMoving == True:
+            if dt <= moveDuration:
+                scale        = (now - startTime) / moveDuration
+                # Ease in/out curve: 3*t^2-2*t^3
+                scale = 3.0 * scale * scale - 2.0 * scale * scale * scale
+                curX         = startX + (destX - startX) * scale
+                curY         = startY + (destY - startY) * scale
+            else:
+                startX       = destX
+                startY       = destY
+                curX         = destX
+                curY         = destY
+                holdDuration = random.uniform(0.15, 1.7)
+                startTime    = now
+                isMoving     = False
+        else:
+            if dt >= holdDuration:
+                destX        = random.uniform(-30.0, 30.0)
+                n            = math.sqrt(900.0 - destX * destX)
+                destY        = random.uniform(-n, n)
+                # Movement is slower in this version because
+                # the WorldEye display is big and the eye
+                # should have some 'mass' to it.
+                moveDuration = random.uniform(0.12, 0.35)
+                startTime    = now
+                isMoving     = True
 
 
-	# Regenerate iris geometry only if size changed by >= 1/2 pixel
-	if abs(p - prevPupilScale) >= irisRegenThreshold:
-		# Interpolate points between min and max pupil sizes
-		interPupil = points_interp(pupilMinPts, pupilMaxPts, p)
-		# Generate mesh between interpolated pupil and iris bounds
-		mesh = points_mesh((None, interPupil, irisPts), 4, -irisZ, True)
-		iris.re_init(pts=mesh)
-		prevPupilScale = p
+    # Regenerate iris geometry only if size changed by >= 1/2 pixel
+    if abs(p - prevPupilScale) >= irisRegenThreshold:
+        # Interpolate points between min and max pupil sizes
+        interPupil = points_interp(pupilMinPts, pupilMaxPts, p)
+        # Generate mesh between interpolated pupil and iris bounds
+        mesh = points_mesh((None, interPupil, irisPts), 4, -irisZ, True)
+        iris.re_init(pts=mesh)
+        prevPupilScale = p
 
-	# Eyelid WIP
+    # Eyelid WIP
 
-	if AUTOBLINK and (now - timeOfLastBlink) >= timeToNextBlink:
-		# Similar to movement, eye blinks are slower in this version
-		timeOfLastBlink = now
-		duration        = random.uniform(0.06, 0.12)
-		if blinkState != 1:
-			blinkState     = 1 # ENBLINK
-			blinkStartTime = now
-			blinkDuration  = duration
-		timeToNextBlink = duration * 3 + random.uniform(0.0, 4.0)
+    if AUTOBLINK and (now - timeOfLastBlink) >= timeToNextBlink:
+        # Similar to movement, eye blinks are slower in this version
+        timeOfLastBlink = now
+        duration        = random.uniform(0.06, 0.12)
+        if blinkState != 1:
+            blinkState     = 1 # ENBLINK
+            blinkStartTime = now
+            blinkDuration  = duration
+        timeToNextBlink = duration * 3 + random.uniform(0.0, 4.0)
 
-	if blinkState: # Eye currently winking/blinking?
-		# Check if blink time has elapsed...
-		if (now - blinkStartTime) >= blinkDuration:
-			# Yes...increment blink state, unless...
-			if (blinkState == 1 and # Enblinking and...
-			    (BLINK_PIN is not None and    # blink pin held
-			     BLINK_PIN.value == False)):
-				# Don't advance yet; eye is held closed
-				pass
-			else:
-				blinkState += 1
-				if blinkState > 2:
-					blinkState = 0 # NOBLINK
-				else:
-					blinkDuration *= 2.0
-					blinkStartTime = now
-	else:
-		if BLINK_PIN is not None and BLINK_PIN == False:
-			blinkState     = 1 # ENBLINK
-			blinkStartTime = now
-			blinkDuration  = random.uniform(0.035, 0.06)
+    if blinkState: # Eye currently winking/blinking?
+        # Check if blink time has elapsed...
+        if (now - blinkStartTime) >= blinkDuration:
+            # Yes...increment blink state, unless...
+            if (blinkState == 1 and # Enblinking and...
+                (BLINK_PIN is not None and    # blink pin held
+                 BLINK_PIN.value == False)):
+                # Don't advance yet; eye is held closed
+                pass
+            else:
+                blinkState += 1
+                if blinkState > 2:
+                    blinkState = 0 # NOBLINK
+                else:
+                    blinkDuration *= 2.0
+                    blinkStartTime = now
+    else:
+        if BLINK_PIN is not None and BLINK_PIN == False:
+            blinkState     = 1 # ENBLINK
+            blinkStartTime = now
+            blinkDuration  = random.uniform(0.035, 0.06)
 
-	if TRACKING:
-		# 0 = fully up, 1 = fully down
-		n = 0.5 - curY / 70.0
-		if   n < 0.0: n = 0.0
-		elif n > 1.0: n = 1.0
-		trackingPos = (trackingPos * 3.0 + n) * 0.25
+    if TRACKING:
+        # 0 = fully up, 1 = fully down
+        n = 0.5 - curY / 70.0
+        if   n < 0.0: n = 0.0
+        elif n > 1.0: n = 1.0
+        trackingPos = (trackingPos * 3.0 + n) * 0.25
 
-	if blinkState:
-		n = (now - blinkStartTime) / blinkDuration
-		if n > 1.0: n = 1.0
-		if blinkState == 2: n = 1.0 - n
-	else:
-		n = 0.0
-	newUpperLidWeight = trackingPos + (n * (1.0 - trackingPos))
-	newLowerLidWeight = (1.0 - trackingPos) + (n * trackingPos)
+    if blinkState:
+        n = (now - blinkStartTime) / blinkDuration
+        if n > 1.0: n = 1.0
+        if blinkState == 2: n = 1.0 - n
+    else:
+        n = 0.0
+    newUpperLidWeight = trackingPos + (n * (1.0 - trackingPos))
+    newLowerLidWeight = (1.0 - trackingPos) + (n * trackingPos)
 
-	if (ruRegen or (abs(newUpperLidWeight - prevUpperLidWeight) >=
-	  upperLidRegenThreshold)):
-		newUpperLidPts = points_interp(upperLidOpenPts,
-		  upperLidClosedPts, newUpperLidWeight)
-		if newUpperLidWeight > prevUpperLidWeight:
-			upperEyelid.re_init(pts=points_mesh(
-			  (upperLidEdgePts, prevUpperLidPts,
-			  newUpperLidPts), 5, 0, False))
-		else:
-			upperEyelid.re_init(pts=points_mesh(
-			  (upperLidEdgePts, newUpperLidPts,
-			  prevUpperLidPts), 5, 0, False))
-		prevUpperLidWeight = newUpperLidWeight
-		prevUpperLidPts    = newUpperLidPts
-		ruRegen = True
-	else:
-		ruRegen = False
+    if (ruRegen or (abs(newUpperLidWeight - prevUpperLidWeight) >=
+      upperLidRegenThreshold)):
+        newUpperLidPts = points_interp(upperLidOpenPts,
+          upperLidClosedPts, newUpperLidWeight)
+        if newUpperLidWeight > prevUpperLidWeight:
+            upperEyelid.re_init(pts=points_mesh(
+              (upperLidEdgePts, prevUpperLidPts,
+              newUpperLidPts), 5, 0, False))
+        else:
+            upperEyelid.re_init(pts=points_mesh(
+              (upperLidEdgePts, newUpperLidPts,
+              prevUpperLidPts), 5, 0, False))
+        prevUpperLidWeight = newUpperLidWeight
+        prevUpperLidPts    = newUpperLidPts
+        ruRegen = True
+    else:
+        ruRegen = False
 
-	if (rlRegen or (abs(newLowerLidWeight - prevLowerLidWeight) >=
-	  lowerLidRegenThreshold)):
-		newLowerLidPts = points_interp(lowerLidOpenPts,
-		  lowerLidClosedPts, newLowerLidWeight)
-		if newLowerLidWeight > prevLowerLidWeight:
-			lowerEyelid.re_init(pts=points_mesh(
-			  (lowerLidEdgePts, prevLowerLidPts,
-			  newLowerLidPts), 5, 0, False))
-		else:
-			lowerEyelid.re_init(pts=points_mesh(
-			  (lowerLidEdgePts, newLowerLidPts,
-			  prevLowerLidPts), 5, 0, False))
-		prevLowerLidWeight = newLowerLidWeight
-		prevLowerLidPts    = newLowerLidPts
-		rlRegen = True
-	else:
-		rlRegen = False
+    if (rlRegen or (abs(newLowerLidWeight - prevLowerLidWeight) >=
+      lowerLidRegenThreshold)):
+        newLowerLidPts = points_interp(lowerLidOpenPts,
+          lowerLidClosedPts, newLowerLidWeight)
+        if newLowerLidWeight > prevLowerLidWeight:
+            lowerEyelid.re_init(pts=points_mesh(
+              (lowerLidEdgePts, prevLowerLidPts,
+              newLowerLidPts), 5, 0, False))
+        else:
+            lowerEyelid.re_init(pts=points_mesh(
+              (lowerLidEdgePts, newLowerLidPts,
+              prevLowerLidPts), 5, 0, False))
+        prevLowerLidWeight = newLowerLidWeight
+        prevLowerLidPts    = newLowerLidPts
+        rlRegen = True
+    else:
+        rlRegen = False
 
-	# Draw eye
+    # Draw eye
 
-	iris.rotateToX(curY)
-	iris.rotateToY(curX)
-	iris.draw()
-	eye.rotateToX(curY)
-	eye.rotateToY(curX)
-	eye.draw()
-	upperEyelid.draw()
-	lowerEyelid.draw()
+    iris.rotateToX(curY)
+    iris.rotateToY(curX)
+    iris.draw()
+    eye.rotateToX(curY)
+    eye.rotateToY(curX)
+    eye.draw()
+    upperEyelid.draw()
+    lowerEyelid.draw()
 
-	k = mykeys.read()
-	if k==27:
-		mykeys.close()
-		DISPLAY.stop()
-		exit(0)
+    k = mykeys.read()
+    if k==27:
+        mykeys.close()
+        DISPLAY.stop()
+        exit(0)
 
 
 def split( # Recursive simulated pupil response when no analog sensor
@@ -431,23 +431,23 @@ def split( # Recursive simulated pupil response when no analog sensor
   endValue,   # Pupil scale ending value (")
   duration,   # Start-to-end time, floating-point seconds
   range):     # +/- random pupil scale at midpoint
-	startTime = time.time()
-	if range >= 0.125: # Limit subdvision count, because recursion
-		duration *= 0.5 # Split time & range in half for subdivision,
-		range    *= 0.5 # then pick random center point within range:
-		midValue  = ((startValue + endValue - range) * 0.5 +
-		             random.uniform(0.0, range))
-		split(startValue, midValue, duration, range)
-		split(midValue  , endValue, duration, range)
-	else: # No more subdivisons, do iris motion...
-		dv = endValue - startValue
-		while True:
-			dt = time.time() - startTime
-			if dt >= duration: break
-			v = startValue + dv * dt / duration
-			if   v < PUPIL_MIN: v = PUPIL_MIN
-			elif v > PUPIL_MAX: v = PUPIL_MAX
-			frame(v) # Draw frame w/interim pupil scale value
+    startTime = time.time()
+    if range >= 0.125: # Limit subdvision count, because recursion
+        duration *= 0.5 # Split time & range in half for subdivision,
+        range    *= 0.5 # then pick random center point within range:
+        midValue  = ((startValue + endValue - range) * 0.5 +
+                     random.uniform(0.0, range))
+        split(startValue, midValue, duration, range)
+        split(midValue  , endValue, duration, range)
+    else: # No more subdivisons, do iris motion...
+        dv = endValue - startValue
+        while True:
+            dt = time.time() - startTime
+            if dt >= duration: break
+            v = startValue + dv * dt / duration
+            if   v < PUPIL_MIN: v = PUPIL_MIN
+            elif v > PUPIL_MAX: v = PUPIL_MAX
+            frame(v) # Draw frame w/interim pupil scale value
 
 
 # MAIN LOOP -- runs continuously -------------------------------------------
@@ -455,21 +455,21 @@ def split( # Recursive simulated pupil response when no analog sensor
 # If script is invoked standalone, not imported by another script,
 # run example test...
 if __name__ == "__main__":
-	while True:
+    while True:
 
-		if PUPIL_IN >= 0: # Pupil scale from sensor
-			v = bonnet.channel[PUPIL_IN].value
-			# If you need to calibrate PUPIL_MIN and MAX,
-			# add a 'print v' here for testing.
-			if   v < PUPIL_MIN: v = PUPIL_MIN
-			elif v > PUPIL_MAX: v = PUPIL_MAX
-			# Scale to 0.0 to 1.0:
-			v = (v - PUPIL_MIN) / (PUPIL_MAX - PUPIL_MIN)
-			if PUPIL_SMOOTH > 0:
-				v = ((currentPupilScale * (PUPIL_SMOOTH - 1) + v) /
-					PUPIL_SMOOTH)
-			frame(v)
-		else: # Fractal auto pupil scale
-			v = random.random()
-			split(currentPupilScale, v, 4.0, 1.0)
-		currentPupilScale = v
+        if PUPIL_IN >= 0: # Pupil scale from sensor
+            v = bonnet.channel[PUPIL_IN].value
+            # If you need to calibrate PUPIL_MIN and MAX,
+            # add a 'print v' here for testing.
+            if   v < PUPIL_MIN: v = PUPIL_MIN
+            elif v > PUPIL_MAX: v = PUPIL_MAX
+            # Scale to 0.0 to 1.0:
+            v = (v - PUPIL_MIN) / (PUPIL_MAX - PUPIL_MIN)
+            if PUPIL_SMOOTH > 0:
+                v = ((currentPupilScale * (PUPIL_SMOOTH - 1) + v) /
+                    PUPIL_SMOOTH)
+            frame(v)
+        else: # Fractal auto pupil scale
+            v = random.random()
+            split(currentPupilScale, v, 4.0, 1.0)
+        currentPupilScale = v
