@@ -63,7 +63,10 @@
 // MIT license.
 // Insights from Tasanakorn's fbcp tool: github.com/tasanakorn/rpi-fbcp
 
+#include <gpiod.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <unistd.h>
 #include <math.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -71,12 +74,14 @@
 #include <linux/spi/spidev.h>
 #include <bcm_host.h>
 
+#include "wlr-screencopy-unstable-v1.h"
+
 // CONFIGURATION AND GLOBAL STUFF ------------------------------------------
 
 #define DC_PIN    5             // These pins connect
 #define RESET_PIN 6             // to BOTH screens
-#define DCMASK    (1 << DC_PIN) // GPIO pin bitmasks of reset + D/C pins
-#define RESETMASK (1 << RESET_PIN)
+#define DCMASK    (1 << DC_PIN) // GPIO pin bitmasks of reset
+#define	CONSUMER  "fbx2"        // For use with gpiod
 
 // Main and auxiliary SPI buses are used concurrently, thus MOSI and SCLK
 // are unique to each screen, plus CS as expected.  First screen ("right
@@ -234,18 +239,8 @@ static struct spi_ioc_transfer xfer = {
   .rx_nbits      = 0,
   .cs_change     = 0 };
 
-// From GPIO example code by Dom and Gert van Loo on elinux.org:
-#define GPIO_BASE    0x200000
-#define BLOCK_SIZE   (4*1024)
-#define INP_GPIO(g)  *(gpio+((g)/10)) &= ~(7<<(((g)%10)*3))
-#define OUT_GPIO(g)  *(gpio+((g)/10)) |=  (1<<(((g)%10)*3))
-#define GPIO_READ(g) (*(gpio + 13) & (1<<(g)))
-
-static volatile unsigned
-  *gpio = NULL, // Memory-mapped GPIO peripheral
-  *gpioSet,     // Write bitmask of GPIO pins to set
-  *gpioClr;     // Write bitmask of GPIO pins to clear
-
+struct gpiod_line *reset_line;
+struct gpiod_line *dc_line;
 
 // UTILITY FUNCTIONS -------------------------------------------------------
 
@@ -254,9 +249,8 @@ static volatile unsigned
 
 // Issue data or command to both SPI displays:
 static void dcX2(uint8_t x, uint8_t dc) {
-	if(dc) *gpioSet = DCMASK; // 0/low = command, 1/high = data
-	else   *gpioClr = DCMASK;
-	xfer.tx_buf = (uint32_t)&x; // Uses global xfer struct,
+    gpiod_line_set_value(dc_line, dc ? 1 : 0);
+	xfer.tx_buf = (uintptr_t)&x; // Uses global xfer struct,
 	xfer.len    = 1;            // as most elements don't change
 	(void)ioctl(eye[0].fd, SPI_IOC_MESSAGE(1), &xfer);
 	(void)ioctl(eye[1].fd, SPI_IOC_MESSAGE(1), &xfer);
@@ -301,7 +295,7 @@ void *spiThreadFunc(void *data) {
 		pthread_barrier_wait(&barr); // This is the 'after' wait
 		pthread_barrier_wait(&barr); // And the 'before' wait
 
-		eye[i].xfer.tx_buf = (uint32_t)eye[i].buf[bufIdx];
+		eye[i].xfer.tx_buf = (uintptr_t)eye[i].buf[bufIdx];
 		bytesToGo = screenBytes;
 		do {
 			bytesThisPass = bytesToGo;
@@ -330,7 +324,9 @@ int main(int argc, char *argv[]) {
 	uint8_t showFPS   = 0;
 	int     bitrate   = 0, // If 0, use default
 	        winFrames = 1, // How often to reset pixel window
-	        i, j, fd;
+	        i, j,
+            ret;
+	struct gpiod_chip *chip;
 
 	while((i = getopt(argc, argv, "otib:w:s")) != -1) {
 		switch(i) {
@@ -366,26 +362,53 @@ int main(int argc, char *argv[]) {
 
 	// GPIO AND SCREEN INIT --------------------------------------------
 
-	if((fd = open("/dev/mem", O_RDWR | O_SYNC)) < 0)
-		err(1, "Can't open /dev/mem (try 'sudo')");
-	gpio = (volatile unsigned *)mmap( // Memory-map I/O
-	  NULL,                 // Any adddress will do
-	  BLOCK_SIZE,           // Mapped block length
-	  PROT_READ|PROT_WRITE, // Enable read+write
-	  MAP_SHARED,           // Shared w/other processes
-	  fd,                   // File to map
-	  bcm_host_get_peripheral_address() + GPIO_BASE);
-	close(fd);              // Not needed after mmap()
-	if(gpio == MAP_FAILED) {
-		err(2, "mmap() failed");
+    bool is_pi5 = false;
+	if((fp = fopen("/dev/gpiochip4", "r"))) {   // Pi 5 uses gpiochip4, the older ones use gpiochip0
+		is_pi5 = true;
+		fclose(fp);
 	}
-	gpioSet = &gpio[7];
-	gpioClr = &gpio[10];
+    char *chipname = "gpiochip0";
+    if (is_pi5) {
+        chipname = "gpiochip4";
+    }
+
+	chip = gpiod_chip_open_by_name(chipname);
+	if (!chip) {
+		err(1, "Open chip failed\n");
+	}
+
+    dc_line = gpiod_chip_get_line(chip, DC_PIN);
+    if (!dc_line) {
+        gpiod_chip_close(chip);
+        err(2, "Get dc line failed\n");
+    }
+
+	ret = gpiod_line_request_output(dc_line, CONSUMER, 0);
+	if (ret < 0) {
+        gpiod_line_release(dc_line);
+        gpiod_chip_close(chip);
+		err(3, "Setting dc line as output failed\n");
+	}
+
+	reset_line = gpiod_chip_get_line(chip, RESET_PIN);
+	if (!reset_line) {
+        gpiod_line_release(dc_line);
+		gpiod_chip_close(chip);
+        err(4, "Get reset line failed\n");
+	}
+
+	ret = gpiod_line_request_output(reset_line, CONSUMER, 0);
+	if (ret < 0) {
+        gpiod_line_release(reset_line);
+        gpiod_line_release(dc_line);
+        gpiod_chip_close(chip);
+		err(5, "Setting reset line as output failed\n");
+	}
 
 	if((eye[0].fd = open("/dev/spidev0.0", O_WRONLY|O_NONBLOCK)) < 0)
-		err(3, "Can't open spidev0.0, is SPI enabled?");
+		err(6, "Can't open spidev0.0, is SPI enabled?");
 	if((eye[1].fd = open("/dev/spidev1.2", O_WRONLY|O_NONBLOCK)) < 0)
-		err(4, "Can't open spidev1.2, is spi1-3cs overlay enabled?");
+		err(7, "Can't open spidev1.2, is spi1-3cs overlay enabled?");
 
 	xfer.speed_hz = bitrate;
 	uint8_t  mode = SPI_MODE_0;
@@ -404,14 +427,18 @@ int main(int argc, char *argv[]) {
 
 	// INITIALIZE SPI SCREENS ------------------------------------------
 
-	INP_GPIO(DC_PIN);    OUT_GPIO(DC_PIN); // Must INP before OUT
-	INP_GPIO(RESET_PIN); OUT_GPIO(RESET_PIN);
 
-	*gpioSet = RESETMASK; usleep(5); // Reset high,
-	*gpioClr = RESETMASK; usleep(5); // low,
-	*gpioSet = RESETMASK; usleep(5); // high
+	gpiod_line_set_value(reset_line, 1); usleep(5); // Reset high,
+	gpiod_line_set_value(reset_line, 0); usleep(5); // low,
+	gpiod_line_set_value(reset_line, 1); usleep(5); // high
 
 	commandList(screen[screenType].init); // Send init commands
+
+    // WAYLAND SCREEN CAPTURE INIT ------------------------------------
+
+    // Insights gained from wayvnc:
+    // https://github.com/any1/wayvnc
+
 
 	// DISPMANX INIT ---------------------------------------------------
 
@@ -421,6 +448,7 @@ int main(int argc, char *argv[]) {
 	// issues screen data directly and concurrently to two 'raw'
 	// SPI displays (no secondary framebuffer device / driver).
 
+    /*
 	DISPMANX_DISPLAY_HANDLE_T  display; // Primary framebuffer display
 	DISPMANX_MODEINFO_T        info;    // Screen dimensions, etc.
 	DISPMANX_RESOURCE_HANDLE_T screen_resource; // Intermediary buf
@@ -556,5 +584,11 @@ int main(int argc, char *argv[]) {
 
 	vc_dispmanx_resource_delete(screen_resource);
 	vc_dispmanx_display_close(display);
+    */
+
+    gpiod_line_release(reset_line);
+    gpiod_line_release(dc_line);
+    gpiod_chip_close(chip);
+
 	return 0;
 }
