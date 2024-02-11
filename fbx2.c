@@ -434,6 +434,46 @@ int main(int argc, char *argv[]) {
 
 	commandList(screen[screenType].init); // Send init commands
 
+
+    // SPI Display Test -----------------------------------------------
+    // Draw red, green, blue to both displays in a loop, waiting 250ms in between
+
+    uint16_t colors[] = {
+        __builtin_bswap16(0xF800),
+        __builtin_bswap16(0x07F0),
+        __builtin_bswap16(0x001F)
+    };
+
+	for(;;) {
+        for(j=0; j<3; j++) {
+            for(i=0; i<2; i++) {
+                uint16_t *buffer = eye[i].buf[bufIdx];
+                for (int y = 0; y < screen[screenType].height; y++) {
+                    for (int x = 0; x < screen[screenType].width; x++) {
+                        buffer[x + y * screen[screenType].width] = colors[j];
+                    }
+                }
+
+                commandList(screen[screenType].win);  // Set window
+                gpiod_line_set_value(dc_line, 1);     // Data
+                uint32_t bytesThisPass, bytesToGo, screenBytes =
+                screen[screenType].width * screen[screenType].height * 2;
+
+                eye[i].xfer.tx_buf = (uintptr_t)eye[i].buf[bufIdx];
+                bytesToGo = screenBytes;
+                do {
+                    bytesThisPass = bytesToGo;
+                    if(bytesThisPass > bufsiz) bytesThisPass = bufsiz;
+                    eye[i].xfer.len = bytesThisPass;
+                    ioctl(eye[i].fd, SPI_IOC_MESSAGE(1), &eye[i].xfer);
+                    eye[i].xfer.tx_buf += bytesThisPass;
+                    bytesToGo          -= bytesThisPass;
+                } while(bytesToGo > 0);
+            }
+            usleep(250 * 1000);
+        }
+    }
+
     // WAYLAND SCREEN CAPTURE INIT ------------------------------------
 
     // Insights gained from wayvnc:
