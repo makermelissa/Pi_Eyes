@@ -11,18 +11,32 @@ LIBS=-pthread -lrt -lm -lbcm_host -lgpiod
 
 # Host deps
 WAYLAND_FLAGS = $(shell $(PKG_CONFIG) wayland-client --cflags --libs)
-WAYLAND_PROTOCOLS_DIR = $(shell $(PKG_CONFIG) wayland-protocols --variable=protocols)
 
 # Build deps
-WAYLAND_SCANNER = $(shell pkg-config --variable=wayland_scanner wayland-scanner)
+WAYLAND_SCANNER = $(shell $(PKG_CONFIG) --variable=wayland_scanner wayland-scanner)
+
+HEADERS=wlr-screencopy-unstable-v1.h xdg-output-unstable-v1.h
+SOURCES=wlr-screencopy-unstable-v1.c xdg-output-unstable-v1.c fbx2.c
+
 
 all: fbx2
 
-fbx2: fbx2.c
-	$(WAYLAND_SCANNER) client-header protocols/wlr-screencopy-unstable-v1.xml wlr-screencopy-unstable-v1.h
-	$(WAYLAND_SCANNER) private-code protocols/wlr-screencopy-unstable-v1.xml wlr-screencopy-unstable-v1.c
-	cc $(CFLAGS) fbx2.c -o fbx2 $(LIBS)
+fbx2: $(HEADERS) $(SOURCES)
+	cc $(CFLAGS) $(SOURCES) -o fbx2 $(LIBS) $(WAYLAND_FLAGS)
 	strip fbx2
 
+wlr-screencopy-unstable-v1.h:
+	$(WAYLAND_SCANNER) client-header protocols/wlr-screencopy-unstable-v1.xml wlr-screencopy-unstable-v1.h
+
+wlr-screencopy-unstable-v1.c:
+	$(WAYLAND_SCANNER) private-code protocols/wlr-screencopy-unstable-v1.xml wlr-screencopy-unstable-v1.c
+
+xdg-output-unstable-v1.h:
+	$(WAYLAND_SCANNER) client-header protocols/xdg-output-unstable-v1.xml xdg-output-unstable-v1.h
+
+xdg-output-unstable-v1.c:
+	$(WAYLAND_SCANNER) private-code protocols/xdg-output-unstable-v1.xml xdg-output-unstable-v1.c
+
+.PHONY: clean
 clean:
 	rm -f fbx2
