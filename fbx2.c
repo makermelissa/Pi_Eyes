@@ -73,7 +73,9 @@
 #include <sys/ioctl.h>
 #include <linux/spi/spidev.h>
 #include <bcm_host.h>
-
+#include <wayland-client.h>
+#include <assert.h>
+#include <png.h>
 #include "wlr-screencopy-unstable-v1.h"
 
 // CONFIGURATION AND GLOBAL STUFF ------------------------------------------
@@ -91,10 +93,13 @@
 // GPIO #20 (MOSI), #21 (SCLK) and #16 (CE2).  CE2 (rather than CE1) is
 // used for 2nd screen as it simplified PCB routing
 
+#define DEBUG            // Uncomment to enable debug output
 #define SCREEN_OLED      0 // Compatible screen types
 #define SCREEN_TFT_GREEN 1 // Just these three
 #define SCREEN_IPS       2 // Other types WILL NOT WORK!
 
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 uint8_t screenType = SCREEN_OLED;
 
 // Screen initialization commands and data.  Derived from Adafruit Arduino
@@ -227,6 +232,28 @@ static struct {
 	struct spi_ioc_transfer xfer; // ioctl() transfer struct
 } eye[2];
 
+static struct {
+	struct wl_buffer *wl_buffer;
+	void *data;
+	enum wl_shm_format format;
+	int width, height, stride;
+	bool y_invert;
+} buffer;
+
+struct format {
+	enum wl_shm_format wl_format;
+	bool is_bgr;
+};
+
+// wl_shm_format describes little-endian formats, libpng uses big-endian
+// formats (so Wayland's ABGR is libpng's RGBA).
+static const struct format formats[] = {
+	{WL_SHM_FORMAT_XRGB8888, true},
+	{WL_SHM_FORMAT_ARGB8888, true},
+	{WL_SHM_FORMAT_XBGR8888, false},
+	{WL_SHM_FORMAT_ABGR8888, false},
+};
+
 static pthread_barrier_t barr;          // For thread synchronization
 static uint8_t           bufIdx = 0;    // Double-buffering index
 static int               bufsiz = 4096; // SPI block xfer size (4K default)
@@ -239,8 +266,30 @@ static struct spi_ioc_transfer xfer = {
   .rx_nbits      = 0,
   .cs_change     = 0 };
 
-struct gpiod_line *reset_line;
-struct gpiod_line *dc_line;
+int32_t output_width, output_height;
+
+enum screencopy_status {
+	SCREENCOPY_STOPPED = 0,
+	SCREENCOPY_IN_PROGRESS,
+	SCREENCOPY_FAILED,
+	SCREENCOPY_FATAL,
+	SCREENCOPY_DONE,
+};
+
+struct gpiod_chip *chip = NULL;
+struct gpiod_line *reset_line = NULL;
+struct gpiod_line *dc_line = NULL;
+
+struct zwlr_screencopy_manager_v1 *manager;
+struct zwlr_screencopy_frame_v1 *frame;
+
+struct wl_display* display = NULL;   // Wayland Display
+struct wl_registry* registry = NULL; // Wayland Global Registry
+struct wl_output* output = NULL;     // Wayland Output
+struct wl_shm* shm = NULL;           // Wayland Shared Memory
+
+bool buffer_copy_done = false;
+enum screencopy_status status;
 
 // UTILITY FUNCTIONS -------------------------------------------------------
 
@@ -310,12 +359,239 @@ void *spiThreadFunc(void *data) {
 	return NULL;
 }
 
+static struct wl_buffer *create_shm_buffer(enum wl_shm_format fmt, int width, int height, int stride, void **data_out) {
+	int size = stride * height;
+
+	const char shm_name[] = "/fbcp-screencopy";
+	int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+	if (fd < 0) {
+		fprintf(stderr, "shm_open failed\n");
+		return NULL;
+	}
+	shm_unlink(shm_name);
+
+	int ret;
+	while ((ret = ftruncate(fd, size)) == EINTR) {
+		// No-op
+	}
+	if (ret < 0) {
+		close(fd);
+		fprintf(stderr, "ftruncate failed\n");
+		return NULL;
+	}
+
+	void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (data == MAP_FAILED) {
+		perror("mmap failed");
+		close(fd);
+		return NULL;
+	}
+
+	struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
+	close(fd);
+	struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, width, height,
+		stride, fmt);
+	wl_shm_pool_destroy(pool);
+
+	*data_out = data;
+	return buffer;
+}
+
+static void write_image(char *filename, enum wl_shm_format wl_fmt, int width,
+		int height, int stride, bool y_invert, png_bytep data) {
+	const struct format *fmt = NULL;
+	for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); ++i) {
+		if (formats[i].wl_format == wl_fmt) {
+			fmt = &formats[i];
+			break;
+		}
+	}
+	if (fmt == NULL) {
+		fprintf(stderr, "unsupported format %"PRIu32"\n", wl_fmt);
+		exit(EXIT_FAILURE);
+	}
+
+	FILE *f = fopen(filename, "wb");
+	if (f == NULL) {
+		fprintf(stderr, "failed to open output file\n");
+		exit(EXIT_FAILURE);
+	}
+
+	png_structp png =
+		png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+	png_infop info = png_create_info_struct(png);
+
+	png_init_io(png, f);
+
+	png_set_IHDR(png, info, width, height, 8, PNG_COLOR_TYPE_RGBA,
+		PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
+		PNG_FILTER_TYPE_DEFAULT);
+
+	if (fmt->is_bgr) {
+		png_set_bgr(png);
+	}
+
+	png_write_info(png, info);
+
+	for (size_t i = 0; i < (size_t)height; ++i) {
+		png_bytep row;
+		if (y_invert) {
+			row = data + (height - i - 1) * stride;
+		} else {
+			row = data + i * stride;
+		}
+		png_write_row(png, row);
+	}
+
+	png_write_end(png, NULL);
+
+	png_destroy_write_struct(&png, &info);
+
+	fclose(f);
+}
+
+static void deinit(void) {
+    if (buffer.wl_buffer != NULL) {
+	    wl_buffer_destroy(buffer.wl_buffer);
+	    munmap(buffer.data, buffer.stride * buffer.height);     // Memory Unmap
+    }
+    if (output) {
+        wl_output_destroy(output);
+    }
+    if (shm) {
+        wl_shm_destroy(shm);
+    }
+    if (manager) {
+        zwlr_screencopy_manager_v1_destroy(manager);
+    }
+    if (registry) {
+        wl_registry_destroy(registry);
+    }
+    if (display) {
+        wl_display_disconnect(display);
+    }
+    if (reset_line) {
+        gpiod_line_release(reset_line);
+    }
+    if (dc_line) {
+        gpiod_line_release(dc_line);
+    }
+    if (chip) {
+        gpiod_chip_close(chip);
+    }
+    pthread_barrier_destroy(&barr);
+}
+
 // Crude error handler (prints message, exits program with status code)
 static int err(int code, char *string) {
+    deinit();
 	(void)puts(string);
 	exit(code);
 }
 
+// EVENT HANDLERS ----------------------------------------------------------
+
+static void registry_add(void *data, struct wl_registry *registry, uint32_t id, const char *interface, uint32_t version) {
+#ifdef DEBUG
+    printf("Loading Interface: %s\n", interface);
+#endif
+	if (strcmp(interface, wl_output_interface.name) == 0 && output == NULL) {
+		output = wl_registry_bind(registry, id, &wl_output_interface, 3);
+        return;
+    }
+    if (strcmp(interface, wl_shm_interface.name) == 0) {
+		shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
+        return;
+	}
+    if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
+        manager = wl_registry_bind(registry, id, &zwlr_screencopy_manager_v1_interface, MIN(3, version));
+	}
+}
+
+static void registry_remove(void *data, struct wl_registry *registry, uint32_t name) {
+	// Not used for this
+}
+
+static void output_handle_geometry(void *data, struct wl_output *wl_output,
+				   int32_t x, int32_t y, int32_t phys_width,
+				   int32_t phys_height, int32_t subpixel,
+				   const char* make, const char* model,
+				   int32_t transform) {
+}
+
+static void output_handle_mode(void *data, struct wl_output *wl_output,
+			       uint32_t flags, int32_t width, int32_t height,
+			       int32_t refresh) {
+    output_width = width;
+    output_height = height;
+#ifdef DEBUG
+	printf("Width: %d, Height: %d\n", width, height);
+#endif
+}
+
+static void output_handle_done(void *data, struct wl_output *wl_output) {
+}
+
+static void output_handle_scale(void *data, struct wl_output *wl_output, int32_t factor) {
+}
+
+static void frame_handle_buffer(void* data,
+			      struct zwlr_screencopy_frame_v1* frame,
+			      enum wl_shm_format format, uint32_t width,
+			      uint32_t height, uint32_t stride) {
+	buffer.format = format;
+	buffer.width = width;
+	buffer.height = height;
+	buffer.stride = stride;
+
+	// Make sure the buffer is not allocated
+	assert(!buffer.wl_buffer);
+	buffer.wl_buffer = create_shm_buffer(format, width, height, stride, &buffer.data);
+	if (buffer.wl_buffer == NULL) {
+		err(9, "failed to create buffer\n");
+	}
+
+    zwlr_screencopy_frame_v1_copy(frame, buffer.wl_buffer);
+}
+
+static void frame_handle_flags(void* data,
+			     struct zwlr_screencopy_frame_v1* frame,
+			     uint32_t flags) {
+
+	buffer.y_invert = !!(flags & ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT);
+}
+
+static void frame_handle_ready(void* data,
+			     struct zwlr_screencopy_frame_v1* frame,
+			     uint32_t sec_hi, uint32_t sec_lo, uint32_t nsec) {
+
+	buffer_copy_done = true;
+}
+
+static void frame_handle_failed(void* data,
+			      struct zwlr_screencopy_frame_v1* frame) {
+    err(8, "Frame copy failed");
+}
+
+static void frame_handle_linux_dmabuf(void* data,
+			      struct zwlr_screencopy_frame_v1* frame,
+			      uint32_t format, uint32_t width, uint32_t height)
+{
+}
+
+static void frame_handle_buffer_done(void* data,
+			      struct zwlr_screencopy_frame_v1* frame)
+{
+}
+
+static void frame_handle_damage(void* data,
+			      struct zwlr_screencopy_frame_v1* frame,
+			      uint32_t x, uint32_t y,
+			      uint32_t width, uint32_t height)
+{
+
+	//wv_buffer_damage_rect(self->front, x, y, width, height);
+}
 
 // INIT AND MAIN LOOP ------------------------------------------------------
 
@@ -326,9 +602,8 @@ int main(int argc, char *argv[]) {
 	        winFrames = 1, // How often to reset pixel window
 	        i, j,
             ret;
-	struct gpiod_chip *chip;
-
-	while((i = getopt(argc, argv, "otib:w:s")) != -1) {
+    const char* display_name = "wayland-1";
+	while((i = getopt(argc, argv, "otib:w:sd:")) != -1) {
 		switch(i) {
 		   case 'o': // Select OLED screen type
 			screenType = SCREEN_OLED;
@@ -348,6 +623,9 @@ int main(int argc, char *argv[]) {
 		   case 's': // Show FPS
 			showFPS = 1;
 			break;
+           case 'd': // Display name
+            display_name = optarg;
+            break;
 		}
 	}
 
@@ -379,29 +657,21 @@ int main(int argc, char *argv[]) {
 
     dc_line = gpiod_chip_get_line(chip, DC_PIN);
     if (!dc_line) {
-        gpiod_chip_close(chip);
         err(2, "Get dc line failed\n");
     }
 
 	ret = gpiod_line_request_output(dc_line, CONSUMER, 0);
 	if (ret < 0) {
-        gpiod_line_release(dc_line);
-        gpiod_chip_close(chip);
 		err(3, "Setting dc line as output failed\n");
 	}
 
 	reset_line = gpiod_chip_get_line(chip, RESET_PIN);
 	if (!reset_line) {
-        gpiod_line_release(dc_line);
-		gpiod_chip_close(chip);
         err(4, "Get reset line failed\n");
 	}
 
 	ret = gpiod_line_request_output(reset_line, CONSUMER, 0);
 	if (ret < 0) {
-        gpiod_line_release(reset_line);
-        gpiod_line_release(dc_line);
-        gpiod_chip_close(chip);
 		err(5, "Setting reset line as output failed\n");
 	}
 
@@ -427,86 +697,83 @@ int main(int argc, char *argv[]) {
 
 	// INITIALIZE SPI SCREENS ------------------------------------------
 
-
 	gpiod_line_set_value(reset_line, 1); usleep(5); // Reset high,
 	gpiod_line_set_value(reset_line, 0); usleep(5); // low,
 	gpiod_line_set_value(reset_line, 1); usleep(5); // high
 
 	commandList(screen[screenType].init); // Send init commands
 
-
-    // SPI Display Test -----------------------------------------------
-    // Draw red, green, blue to both displays in a loop, waiting 250ms in between
-
-    uint16_t colors[] = {
-        __builtin_bswap16(0xF800),
-        __builtin_bswap16(0x07F0),
-        __builtin_bswap16(0x001F)
-    };
-
-	for(;;) {
-        for(j=0; j<3; j++) {
-            for(i=0; i<2; i++) {
-                uint16_t *buffer = eye[i].buf[bufIdx];
-                for (int y = 0; y < screen[screenType].height; y++) {
-                    for (int x = 0; x < screen[screenType].width; x++) {
-                        buffer[x + y * screen[screenType].width] = colors[j];
-                    }
-                }
-
-                commandList(screen[screenType].win);  // Set window
-                gpiod_line_set_value(dc_line, 1);     // Data
-                uint32_t bytesThisPass, bytesToGo, screenBytes =
-                screen[screenType].width * screen[screenType].height * 2;
-
-                eye[i].xfer.tx_buf = (uintptr_t)eye[i].buf[bufIdx];
-                bytesToGo = screenBytes;
-                do {
-                    bytesThisPass = bytesToGo;
-                    if(bytesThisPass > bufsiz) bytesThisPass = bufsiz;
-                    eye[i].xfer.len = bytesThisPass;
-                    ioctl(eye[i].fd, SPI_IOC_MESSAGE(1), &eye[i].xfer);
-                    eye[i].xfer.tx_buf += bytesThisPass;
-                    bytesToGo          -= bytesThisPass;
-                } while(bytesToGo > 0);
-            }
-            usleep(250 * 1000);
-        }
-    }
-
     // WAYLAND SCREEN CAPTURE INIT ------------------------------------
 
     // Insights gained from wayvnc:
     // https://github.com/any1/wayvnc
-
-
-	// DISPMANX INIT ---------------------------------------------------
-
-	// Insights gained from Tasanakorn's fbcp utility:
-	// https://github.com/tasanakorn/rpi-fbcp
 	// Rather than copying framebuffer-to-framebuffer, this code
 	// issues screen data directly and concurrently to two 'raw'
 	// SPI displays (no secondary framebuffer device / driver).
 
-    /*
-	DISPMANX_DISPLAY_HANDLE_T  display; // Primary framebuffer display
-	DISPMANX_MODEINFO_T        info;    // Screen dimensions, etc.
-	DISPMANX_RESOURCE_HANDLE_T screen_resource; // Intermediary buf
-	uint32_t                   handle;
-	VC_RECT_T                  rect;
+    bool overlay_cursor = false;
 	uint16_t                  *pixelBuf;
 
-	bcm_host_init();
+    static const struct wl_registry_listener registry_listener = {
+        .global = registry_add,
+        .global_remove = registry_remove,
+    };
 
-	if(!(display = vc_dispmanx_display_open(0))) {
-		err(6, "Can't open primary display");
+    static const struct wl_output_listener output_listener = {
+        .geometry = output_handle_geometry,
+        .mode = output_handle_mode,
+        .done = output_handle_done,
+        .scale = output_handle_scale,
+    };
+
+	static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
+		.buffer = frame_handle_buffer,
+		.flags = frame_handle_flags,
+		.ready = frame_handle_ready,
+		.failed = frame_handle_failed,
+		.linux_dmabuf = frame_handle_linux_dmabuf,
+		.buffer_done = frame_handle_buffer_done,
+		.damage = frame_handle_damage,
+	};
+
+    display = wl_display_connect(display_name);  // TODO: Look at starting detached and then attaching later if this doesn't work
+	if (!display) {
+    	err(6, "Failed to connect to display. Ensure wayland is running with that display name.");
 	}
 
-	if(vc_dispmanx_display_get_info(display, &info)) {
-		err(7, "Can't get primary display information");
+    registry = wl_display_get_registry(display);
+	if (!registry) {
+		err(7, "Could not locate the wayland compositor object registry");
 	}
 
-	// info.width and info.height are primary display dimensions.
+	wl_registry_add_listener(registry, &registry_listener, NULL);
+	wl_display_roundtrip(display); // Initialize the global registry interfaces
+
+	if (!shm) {
+		err(8, "Compositor is missing wl_shm\n");
+	}
+
+    if (!manager) {
+        err(9, "Compositor doesn't support wlr-screencopy-unstable-v1. Exiting.");
+    }
+
+	if (output == NULL) {
+		err(10, "no output available\n");
+	}
+
+    // Set up the output listener to get the geometry
+    wl_output_add_listener(output, &output_listener, NULL);
+
+    // Set up the frame listener
+    frame = zwlr_screencopy_manager_v1_capture_output(manager, overlay_cursor, output);
+    zwlr_screencopy_frame_v1_add_listener(frame, &frame_listener, NULL);
+
+	while (!buffer_copy_done && wl_display_dispatch(display) != -1) {
+		// Wait for buffer copy to finish
+        // Needed for dimensions of the first frame
+	}
+
+	// output_width and output_height are primary display dimensions.
 	// Create a 16-bit (5/6/5) offscreen resource that's 1/2 the display
 	// size.  GPU bilinear interpolation then yields 2x2 pixel averaging.
 	// Note that some resource constraints exist but possibly not
@@ -515,8 +782,8 @@ int main(int argc, char *argv[]) {
 	// is extremely flexible, not all resolutions will work here, and
 	// it may require some configuration, testing and reboots.
 
-	int width  = (info.width  + 1) / 2, // Resource dimensions
-	    height = (info.height + 1) / 2;
+	int width  = (output_width  + 1) / 2, // Resource dimensions
+	    height = (output_height + 1) / 2;
 
 	// Also determine positions of upper-left corners for the two
 	// SPI screens, and corresponding offsets into pixelBuf[].
@@ -531,19 +798,24 @@ int main(int argc, char *argv[]) {
 	// main RAM -- VideoCore will copy the primary framebuffer
 	// contents to this resource while providing interpolated
 	// scaling plus 8/8/8 -> 5/6/5 dithering.
+    /*
 	if(!(screen_resource = vc_dispmanx_resource_create(
 	  VC_IMAGE_RGB565, width, height, &handle))) {
 		vc_dispmanx_display_close(display);
 		err(8, "Can't create screen buffer");
 	}
 	vc_dispmanx_rect_set(&rect, 0, 0, width, height);
+*/
 
 	// Create a buffer in RAM w/same dimensions as offscreen
 	// resource, 16 bits per pixel.
 	if(!(pixelBuf = (uint16_t *)malloc(width * height * 2))) {
-		vc_dispmanx_display_close(display);
-		err(9, "Can't malloc pixelBuf");
+		err(11, "Can't malloc pixelBuf");
 	}
+
+    // Save the buffer as a PNG file as proof we are grabbing the display
+	write_image("wayland-screenshot.png", buffer.format, buffer.width,
+		buffer.height, buffer.stride, buffer.y_invert, buffer.data);
 
 	// Initialize SPI transfer threads and synchronization barrier
 	pthread_barrier_init(&barr, NULL, 3);
@@ -558,16 +830,15 @@ int main(int argc, char *argv[]) {
 	int       winCount = 0,
 	          w = screen[screenType].width,
 	          h = screen[screenType].height;
-
 	for(;;) {
 
 		// Framebuffer -> scale & dither to intermediary
-		vc_dispmanx_snapshot(display, screen_resource, 0);
+		//vc_dispmanx_snapshot(display, screen_resource, 0);
+
 		// Intermediary -> main RAM (tried doing some stuff with
 		// an 'optimal' bounding rect but it just crashed & burned,
 		// so doing full-screen transfers for now).
-		vc_dispmanx_resource_read_data(screen_resource, &rect,
-		  pixelBuf, width * 2);
+		//vc_dispmanx_resource_read_data(screen_resource, &rect, pixelBuf, width * 2);
 
 		// Crop & transfer rects to eye buffers, flip hi/lo bytes
 		j    = 1 - bufIdx; // Render to 'back' buffer
@@ -599,7 +870,7 @@ int main(int argc, char *argv[]) {
 		// (performance difference is negligible).
 		if(++winCount >= winFrames) {
 			commandList(screen[screenType].win);
-			*gpioSet = DCMASK; // DC high (data)
+            gpiod_line_set_value(dc_line, 1); // DC high (data)
 			winCount = 0;
 		}
 
@@ -622,13 +893,6 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	vc_dispmanx_resource_delete(screen_resource);
-	vc_dispmanx_display_close(display);
-    */
-
-    gpiod_line_release(reset_line);
-    gpiod_line_release(dc_line);
-    gpiod_chip_close(chip);
-
+    deinit();
 	return 0;
 }
