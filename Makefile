@@ -7,7 +7,7 @@ CFLAGS=-Wall -Ofast -fomit-frame-pointer -funroll-loops \
  -I/opt/vc/include/interface/vmcs_host/linux \
  -L/opt/vc/lib
 
-LIBS=-pthread -lrt -lm -lbcm_host -lgpiod -lpng
+LIBS=-pthread -lrt -lm -lbcm_host -lgpiod
 
 # Host deps
 WAYLAND_FLAGS = $(shell $(PKG_CONFIG) wayland-client --cflags --libs)

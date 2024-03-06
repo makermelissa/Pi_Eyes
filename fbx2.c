@@ -75,7 +75,6 @@
 #include <bcm_host.h>
 #include <wayland-client.h>
 #include <assert.h>
-#include <png.h>
 #include "wlr-screencopy-unstable-v1.h"
 
 // CONFIGURATION AND GLOBAL STUFF ------------------------------------------
@@ -397,59 +396,6 @@ static struct wl_buffer *create_shm_buffer(enum wl_shm_format fmt, int width, in
 	return buffer;
 }
 
-static void write_image(char *filename, enum wl_shm_format wl_fmt, int width,
-		int height, int stride, bool y_invert, png_bytep data) {
-	const struct format *fmt = NULL;
-	for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); ++i) {
-		if (formats[i].wl_format == wl_fmt) {
-			fmt = &formats[i];
-			break;
-		}
-	}
-	if (fmt == NULL) {
-		fprintf(stderr, "unsupported format %"PRIu32"\n", wl_fmt);
-		exit(EXIT_FAILURE);
-	}
-
-	FILE *f = fopen(filename, "wb");
-	if (f == NULL) {
-		fprintf(stderr, "failed to open output file\n");
-		exit(EXIT_FAILURE);
-	}
-
-	png_structp png =
-		png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-	png_infop info = png_create_info_struct(png);
-
-	png_init_io(png, f);
-
-	png_set_IHDR(png, info, width, height, 8, PNG_COLOR_TYPE_RGBA,
-		PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
-		PNG_FILTER_TYPE_DEFAULT);
-
-	if (fmt->is_bgr) {
-		png_set_bgr(png);
-	}
-
-	png_write_info(png, info);
-
-	for (size_t i = 0; i < (size_t)height; ++i) {
-		png_bytep row;
-		if (y_invert) {
-			row = data + (height - i - 1) * stride;
-		} else {
-			row = data + i * stride;
-		}
-		png_write_row(png, row);
-	}
-
-	png_write_end(png, NULL);
-
-	png_destroy_write_struct(&png, &info);
-
-	fclose(f);
-}
-
 static void deinit(void) {
     if (buffer.wl_buffer != NULL) {
 	    wl_buffer_destroy(buffer.wl_buffer);
@@ -487,6 +433,92 @@ static int err(int code, char *string) {
     deinit();
 	(void)puts(string);
 	exit(code);
+}
+
+// Helper function to clip the RGB values before conversion to avoid overflow.
+static inline uint8_t clip_rgb_to_rgb565(int value) {
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return (uint8_t)value;
+}
+
+// Convert 3 8-bit pixels to RGB565 format.
+static inline uint16_t to_rgb565(int r, int g, int b) {
+    return ((clip_rgb_to_rgb565(r) >> 3) << 11) | ((clip_rgb_to_rgb565(g) >> 2) << 5) | (clip_rgb_to_rgb565(b) >> 3);
+}
+
+// Cubic interpolation helper function.
+static float cubic(float x) {
+    const float alpha = -0.5; // Change this for different bicubic interpolations.
+    if (x < 0) x = -x;
+    float z = 0.0;
+    if (x < 1.0) {
+        z = (alpha + 2.0) * pow(x, 3) - (alpha + 3.0) * pow(x, 2) + 1;
+    } else if (x < 2.0) {
+        z = alpha * pow(x, 3) - 5.0 * alpha * pow(x, 2) + 8.0 * alpha * x - 4.0 * alpha;
+    }
+    return z;
+}
+
+// Bicubic interpolation for a single pixel.
+static void bicubic_interpolate(const uint8_t* input, uint16_t* output, int x, int y, float x_ratio, float y_ratio, int width, int height, bool is_bgr) {
+    float gx, gy, blue, red, green;
+    blue = red = green = 0.0;
+    for (int m = -1; m <= 2; m++) {
+        for (int n = -1; n <= 2; n++) {
+            // Calculate the position of the sample.
+            gx = x + n * x_ratio;
+            gy = y + m * y_ratio;
+
+            // Calculate the weight for the sample.
+            float wx = cubic(fabs(n - x_ratio));
+            float wy = cubic(fabs(m - y_ratio));
+
+            int px = MIN(MAX((int)gx, 0), width - 1);
+            int py = MIN(MAX((int)gy, 0), height - 1);
+
+            const uint32_t* pixel = (const uint32_t*)(input + (py * width + px) * 4); // 4 bytes per pixel
+            red   += ((*pixel >> 16) & 0xFF) * wx * wy;
+            green += ((*pixel >> 8) & 0xFF) * wx * wy;
+            blue  += (*pixel & 0xFF) * wx * wy;
+        }
+    }
+
+    // Clip and convert the color to RGB565.
+    if (is_bgr) {
+        *output = to_rgb565((int)red, (int)green, (int)blue);
+    } else {
+        *output = to_rgb565((int)blue, (int)green, (int)red);
+    }
+}
+
+// Main function to resize and convert an image buffer.
+// `input` is the source buffer, `output` is the destination buffer, and new dimensions are `newWidth` x `newHeight`.
+// Assumes the input is in XBGR8888 format.
+void resize_and_convert_to_rgb565(const uint8_t* input, uint16_t* output, int width, int height, int newWidth, int newHeight, enum wl_shm_format wl_fmt) {
+    float x_ratio = width / (float)newWidth;
+    float y_ratio = height / (float)newHeight;
+    float px, py;
+
+	const struct format *fmt = NULL;
+	for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); ++i) {
+		if (formats[i].wl_format == wl_fmt) {
+			fmt = &formats[i];
+			break;
+		}
+	}
+	if (fmt == NULL) {
+		fprintf(stderr, "unsupported format %"PRIu32"\n", wl_fmt);
+		exit(EXIT_FAILURE);
+	}
+
+    for (int i = 0; i < newHeight; i++) {
+        for (int j = 0; j < newWidth; j++) {
+            px = floor(j * x_ratio);
+            py = floor(i * y_ratio);
+            bicubic_interpolate(input, &output[i * newWidth + j], (int)px, (int)py, x_ratio, y_ratio, width, height, fmt->is_bgr);
+        }
+    }
 }
 
 // EVENT HANDLERS ----------------------------------------------------------
@@ -794,28 +826,11 @@ int main(int argc, char *argv[]) {
 	             (width / 2 - screen[screenType].width) / 2,
 	    offset1 = offset0 + width / 2;
 
-	// screen_resource is an intermediary between framebuffer and
-	// main RAM -- VideoCore will copy the primary framebuffer
-	// contents to this resource while providing interpolated
-	// scaling plus 8/8/8 -> 5/6/5 dithering.
-    /*
-	if(!(screen_resource = vc_dispmanx_resource_create(
-	  VC_IMAGE_RGB565, width, height, &handle))) {
-		vc_dispmanx_display_close(display);
-		err(8, "Can't create screen buffer");
-	}
-	vc_dispmanx_rect_set(&rect, 0, 0, width, height);
-*/
-
 	// Create a buffer in RAM w/same dimensions as offscreen
 	// resource, 16 bits per pixel.
 	if(!(pixelBuf = (uint16_t *)malloc(width * height * 2))) {
 		err(11, "Can't malloc pixelBuf");
 	}
-
-    // Save the buffer as a PNG file as proof we are grabbing the display
-	write_image("wayland-screenshot.png", buffer.format, buffer.width,
-		buffer.height, buffer.stride, buffer.y_invert, buffer.data);
 
 	// Initialize SPI transfer threads and synchronization barrier
 	pthread_barrier_init(&barr, NULL, 3);
@@ -831,14 +846,12 @@ int main(int argc, char *argv[]) {
 	          w = screen[screenType].width,
 	          h = screen[screenType].height;
 	for(;;) {
+        while (!buffer_copy_done && wl_display_dispatch(display) != -1) {
+            // Wait for buffer copy to finish
+        }
 
-		// Framebuffer -> scale & dither to intermediary
-		//vc_dispmanx_snapshot(display, screen_resource, 0);
-
-		// Intermediary -> main RAM (tried doing some stuff with
-		// an 'optimal' bounding rect but it just crashed & burned,
-		// so doing full-screen transfers for now).
-		//vc_dispmanx_resource_read_data(screen_resource, &rect, pixelBuf, width * 2);
+        resize_and_convert_to_rgb565(buffer.data, pixelBuf, buffer.width, buffer.height, width, height, buffer.format);
+        puts("Frame");
 
 		// Crop & transfer rects to eye buffers, flip hi/lo bytes
 		j    = 1 - bufIdx; // Render to 'back' buffer
