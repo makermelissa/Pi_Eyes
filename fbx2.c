@@ -63,6 +63,8 @@
 // MIT license.
 // Insights from Tasanakorn's fbcp tool: github.com/tasanakorn/rpi-fbcp
 
+#include <time.h>
+#include <sys/time.h>
 #include <gpiod.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -289,7 +291,6 @@ struct wl_shm* shm = NULL;           // Wayland Shared Memory
 
 bool buffer_copy_done = false;
 enum screencopy_status status;
-
 // UTILITY FUNCTIONS -------------------------------------------------------
 
 #define COMMAND 0 // Values for last argument
@@ -321,15 +322,24 @@ static void commandList(const uint8_t *ptr) { // pass in -> command list
 	}
 }
 
+double start_time;
+void print_time_elapsed(char *message) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    double seconds = (tv.tv_sec - start_time) + (tv.tv_usec / 1000000.0);
+
+    printf("%s: %f seconds\n", message, seconds);
+}
+
 // Each eye's SPI transfers are handled by a separate thread, to provide
 // concurrent non-blocking transfers to both displays while the main thread
 // processes the next frame.  Same function is used for both eyes, each in
 // its own thread; eye index is passed in.
 void *spiThreadFunc(void *data) {
 	int      i = *(uint8_t *)data; // Pass in eye index
-	uint32_t bytesThisPass, bytesToGo, screenBytes =
-	  screen[screenType].width * screen[screenType].height * 2;
-
+	uint32_t bytesThisPass,
+        bytesToGo,
+        screenBytes = screen[screenType].width * screen[screenType].height * 2;
 	for(;;) {
 		// POSIX thread "barriers" are used to sync the main thread
 		// with the SPI transfer threads.  This needs to happen at
@@ -341,10 +351,13 @@ void *spiThreadFunc(void *data) {
 		// main() loop is entered; it processes a frame before
 		// waiting for prior transfers to finish.
 		pthread_barrier_wait(&barr); // This is the 'after' wait
+        print_time_elapsed("SPI Write Thread After Wait");
 		pthread_barrier_wait(&barr); // And the 'before' wait
+        print_time_elapsed("SPI Write Thread Before Wait");
 
 		eye[i].xfer.tx_buf = (uintptr_t)eye[i].buf[bufIdx];
 		bytesToGo = screenBytes;
+        print_time_elapsed("SPI Write Start");
 		do {
 			bytesThisPass = bytesToGo;
 			if(bytesThisPass > bufsiz) bytesThisPass = bufsiz;
@@ -354,6 +367,7 @@ void *spiThreadFunc(void *data) {
 			eye[i].xfer.tx_buf += bytesThisPass;
 			bytesToGo          -= bytesThisPass;
 		} while(bytesToGo > 0);
+        print_time_elapsed("SPI Write End");
 	}
 	return NULL;
 }
@@ -634,6 +648,9 @@ int main(int argc, char *argv[]) {
 	        winFrames = 1, // How often to reset pixel window
 	        i, j,
             ret;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    start_time = tv.tv_sec + (tv.tv_usec / 1000000.0);
     const char* display_name = "wayland-1";
 	while((i = getopt(argc, argv, "otib:w:sd:")) != -1) {
 		switch(i) {
@@ -849,9 +866,10 @@ int main(int argc, char *argv[]) {
         while (!buffer_copy_done && wl_display_dispatch(display) != -1) {
             // Wait for buffer copy to finish
         }
+        print_time_elapsed("Buffer Copy");
 
         resize_and_convert_to_rgb565(buffer.data, pixelBuf, buffer.width, buffer.height, width, height, buffer.format);
-        puts("Frame");
+        print_time_elapsed("Resize");
 
 		// Crop & transfer rects to eye buffers, flip hi/lo bytes
 		j    = 1 - bufIdx; // Render to 'back' buffer
@@ -869,9 +887,11 @@ int main(int argc, char *argv[]) {
 			dst0 += w;
 			dst1 += w;
 		}
+        print_time_elapsed("Crop Rects");
 
-		// Sync up all threads; wait for prior transfers to finish
+    	// Sync up all threads; wait for prior transfers to finish
 		pthread_barrier_wait(&barr);
+        print_time_elapsed("Window Address Sync Threads");
 
 		// Before pushing data to SPI screens, the pixel 'window'
 		// is periodically reset to force screen data pointer back
@@ -886,11 +906,13 @@ int main(int argc, char *argv[]) {
             gpiod_line_set_value(dc_line, 1); // DC high (data)
 			winCount = 0;
 		}
+        print_time_elapsed("Pixel Window");
 
 		// With screen commands now issued, sync up the
 		// threads again, they'll start pushing data...
 		bufIdx   = 1 - bufIdx;       // Swap buffers
 		pthread_barrier_wait(&barr); // Activates data-write thread
+        print_time_elapsed("Data Write Sync Threads");
 
 		if(showFPS) {
 			// Show approx. frames-per-second once per second.
@@ -904,6 +926,7 @@ int main(int argc, char *argv[]) {
 				prevTime = t;
 			}
 		}
+        print_time_elapsed("Show FPS");
 	}
 
     deinit();
