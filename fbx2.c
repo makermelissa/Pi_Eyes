@@ -263,9 +263,10 @@ static struct spi_ioc_transfer xfer = {
   .delay_usecs   = 0, // commands (not pixel data) to both screens.
   .bits_per_word = 8,
   .pad           = 0,
-  .tx_nbits      = 0,
-  .rx_nbits      = 0,
-  .cs_change     = 0 };
+  .tx_nbits      = 8,
+  .rx_nbits      = 8,
+  .cs_change     = 0
+};
 
 int32_t output_width, output_height;
 
@@ -299,10 +300,47 @@ enum screencopy_status status;
 // Issue data or command to both SPI displays:
 static void dcX2(uint8_t x, uint8_t dc) {
     gpiod_line_set_value(dc_line, dc ? 1 : 0);
+    int ret;
 	xfer.tx_buf = (uintptr_t)&x; // Uses global xfer struct,
 	xfer.len    = 1;            // as most elements don't change
-	(void)ioctl(eye[0].fd, SPI_IOC_MESSAGE(1), &xfer);
-	(void)ioctl(eye[1].fd, SPI_IOC_MESSAGE(1), &xfer);
+	ret = ioctl(eye[0].fd, SPI_IOC_MESSAGE(1), &xfer);
+    if (ret < 0) {
+        printf("Eye 0 ");
+        if (errno == EBADF) {
+            printf("invalid file descriptor\n");
+        } else if (errno == EFAULT) {
+            printf("invalid buffer\n");
+        } else if (errno == EINVAL) {
+            printf("invalid ioctl\n");
+        } else if (errno == EIO) {
+            printf("input/output error\n");
+        } else if (errno == ENOTTY) {
+            printf("inappropriate ioctl for device\n");
+        } else if (errno == EPERM) {
+            printf("operation not permitted\n");
+        } else if (errno == ETIMEDOUT) {
+            printf("ioctl timeout\n");
+        }
+    }
+	ret = ioctl(eye[1].fd, SPI_IOC_MESSAGE(1), &xfer);
+    if (ret < 0) {
+        printf("Eye 1 ");
+        if (errno == EBADF) {
+            printf("invalid file descriptor\n");
+        } else if (errno == EFAULT) {
+            printf("invalid buffer\n");
+        } else if (errno == EINVAL) {
+            printf("invalid ioctl\n");
+        } else if (errno == EIO) {
+            printf("input/output error\n");
+        } else if (errno == ENOTTY) {
+            printf("inappropriate ioctl for device\n");
+        } else if (errno == EPERM) {
+            printf("operation not permitted\n");
+        } else if (errno == ETIMEDOUT) {
+            printf("ioctl timeout\n");
+        }
+    }
 }
 
 // Issue a list of commands (and arguments, delays) to both displays:
@@ -324,11 +362,13 @@ static void commandList(const uint8_t *ptr) { // pass in -> command list
 
 double start_time;
 void print_time_elapsed(char *message) {
+#ifdef DEBUG
     struct timeval tv;
     gettimeofday(&tv, NULL);
     double seconds = (tv.tv_sec - start_time) + (tv.tv_usec / 1000000.0);
 
     printf("%s: %f seconds\n", message, seconds);
+#endif
 }
 
 // Each eye's SPI transfers are handled by a separate thread, to provide
@@ -340,6 +380,7 @@ void *spiThreadFunc(void *data) {
 	uint32_t bytesThisPass,
         bytesToGo,
         screenBytes = screen[screenType].width * screen[screenType].height * 2;
+    int ret;
 	for(;;) {
 		// POSIX thread "barriers" are used to sync the main thread
 		// with the SPI transfer threads.  This needs to happen at
@@ -354,16 +395,32 @@ void *spiThreadFunc(void *data) {
         print_time_elapsed("SPI Write Thread After Wait");
 		pthread_barrier_wait(&barr); // And the 'before' wait
         print_time_elapsed("SPI Write Thread Before Wait");
-
 		eye[i].xfer.tx_buf = (uintptr_t)eye[i].buf[bufIdx];
 		bytesToGo = screenBytes;
         print_time_elapsed("SPI Write Start");
 		do {
-			bytesThisPass = bytesToGo;
-			if(bytesThisPass > bufsiz) bytesThisPass = bufsiz;
+			bytesThisPass = bufsiz;
+			if(bytesToGo < bufsiz) bytesThisPass = bytesToGo;
 			eye[i].xfer.len = bytesThisPass;
-			(void)ioctl(eye[i].fd, SPI_IOC_MESSAGE(1),
-			  &eye[i].xfer);
+			ret = ioctl(eye[i].fd, SPI_IOC_MESSAGE(1), &eye[i].xfer);
+            if (ret < 0) {
+                printf("Eye %d: ", i);
+                if (errno == EBADF) {
+                    printf("invalid file descriptor\n");
+                } else if (errno == EFAULT) {
+                    printf("invalid buffer\n");
+                } else if (errno == EINVAL) {
+                    printf("invalid ioctl\n");
+                } else if (errno == EIO) {
+                    printf("input/output error\n");
+                } else if (errno == ENOTTY) {
+                    printf("inappropriate ioctl for device\n");
+                } else if (errno == EPERM) {
+                    printf("operation not permitted\n");
+                } else if (errno == ETIMEDOUT) {
+                    printf("ioctl timeout\n");
+                }
+            }
 			eye[i].xfer.tx_buf += bytesThisPass;
 			bytesToGo          -= bytesThisPass;
 		} while(bytesToGo > 0);
@@ -411,6 +468,7 @@ static struct wl_buffer *create_shm_buffer(enum wl_shm_format fmt, int width, in
 }
 
 static void deinit(void) {
+    pthread_barrier_destroy(&barr);
     if (buffer.wl_buffer != NULL) {
 	    wl_buffer_destroy(buffer.wl_buffer);
 	    munmap(buffer.data, buffer.stride * buffer.height);     // Memory Unmap
@@ -439,7 +497,11 @@ static void deinit(void) {
     if (chip) {
         gpiod_chip_close(chip);
     }
-    pthread_barrier_destroy(&barr);
+    for (int i = 0; i < 2; i++) {
+        if (eye[i].fd >= 0) {
+            close(eye[i].fd);
+        }
+    }
 }
 
 // Crude error handler (prints message, exits program with status code)
@@ -672,7 +734,7 @@ int main(int argc, char *argv[]) {
 		   case 's': // Show FPS
 			showFPS = 1;
 			break;
-           case 'd': // Display name
+           case 'd': // Wayland Display name
             display_name = optarg;
             break;
 		}
@@ -733,13 +795,13 @@ int main(int argc, char *argv[]) {
 	uint8_t  mode = SPI_MODE_0;
 	for(i=0; i<2; i++) {
 		ioctl(eye[i].fd, SPI_IOC_WR_MODE, &mode);
-		ioctl(eye[i].fd, SPI_IOC_WR_MAX_SPEED_HZ, bitrate);
+		ioctl(eye[i].fd, SPI_IOC_WR_MAX_SPEED_HZ, &bitrate);
 		memcpy(&eye[i].xfer, &xfer, sizeof(xfer));
 		for(j=0; j<2; j++) {
 			if(NULL == (eye[i].buf[j] = (uint16_t *)malloc(
 			  screen[screenType].width *
 			  screen[screenType].height * sizeof(uint16_t)))) {
-				err(5, "Eye buffer malloc failed");
+				err(8, "Eye buffer malloc failed");
 			}
 		}
 	}
@@ -787,27 +849,27 @@ int main(int argc, char *argv[]) {
 
     display = wl_display_connect(display_name);  // TODO: Look at starting detached and then attaching later if this doesn't work
 	if (!display) {
-    	err(6, "Failed to connect to display. Ensure wayland is running with that display name.");
+    	err(9, "Failed to connect to display. Ensure wayland is running with that display name.");
 	}
 
     registry = wl_display_get_registry(display);
 	if (!registry) {
-		err(7, "Could not locate the wayland compositor object registry");
+		err(10, "Could not locate the wayland compositor object registry");
 	}
 
 	wl_registry_add_listener(registry, &registry_listener, NULL);
 	wl_display_roundtrip(display); // Initialize the global registry interfaces
 
 	if (!shm) {
-		err(8, "Compositor is missing wl_shm\n");
+		err(11, "Compositor is missing wl_shm\n");
 	}
 
     if (!manager) {
-        err(9, "Compositor doesn't support wlr-screencopy-unstable-v1. Exiting.");
+        err(12, "Compositor doesn't support wlr-screencopy-unstable-v1. Exiting.");
     }
 
 	if (output == NULL) {
-		err(10, "no output available\n");
+		err(13, "no output available\n");
 	}
 
     // Set up the output listener to get the geometry
