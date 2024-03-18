@@ -32,7 +32,7 @@
 // ideally should be set for 640x480 pixels for 128x128 screens (OLED or
 // TFT), or 1280x720 for 240x240 screens (IPS) for optimal interpolation.
 // Do this even if no monitor attached; this still configures the
-// framebuffer.  In /boot/config.txt:
+// framebuffer.  In /boot/firmware/config.txt:
 //     hdmi_force_hotplug=1
 //     hdmi_group=2
 //     hdmi_mode=87
@@ -78,6 +78,8 @@
 #include <wayland-client.h>
 #include <assert.h>
 #include "wlr-screencopy-unstable-v1.h"
+#include "linux-dmabuf-unstable-v1.h"
+#include "xdg-output-unstable-v1.h"
 
 // CONFIGURATION AND GLOBAL STUFF ------------------------------------------
 
@@ -95,9 +97,13 @@
 // used for 2nd screen as it simplified PCB routing
 
 #define DEBUG            // Uncomment to enable debug output
+//#define DEBUG_TIMESTAMPS // Uncomment to enable debug timestamps
 #define SCREEN_OLED      0 // Compatible screen types
 #define SCREEN_TFT_GREEN 1 // Just these three
 #define SCREEN_IPS       2 // Other types WILL NOT WORK!
+#define DISPLAY_COUNT    1 // Use 1 or 2 screens
+
+//#define USE_DAMAGE         // Use damage protocol for screencopy partial updates
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -231,7 +237,7 @@ static struct {
 	uint16_t  *buf[2];            // Double-buffered eye data 16 BPP
 	pthread_t  thread;            // Thread ID of eye's spiThreadFunc()
 	struct spi_ioc_transfer xfer; // ioctl() transfer struct
-} eye[2];
+} eye[DISPLAY_COUNT];
 
 static struct {
 	struct wl_buffer *wl_buffer;
@@ -281,16 +287,23 @@ enum screencopy_status {
 struct gpiod_chip *chip = NULL;
 struct gpiod_line *reset_line = NULL;
 struct gpiod_line *dc_line = NULL;
+static struct gbm_device *gbm_device = NULL;
+static struct zwp_linux_dmabuf_v1 *dmabuf = NULL;
+struct zwlr_screencopy_manager_v1 *manager = NULL;
+struct zwlr_screencopy_frame_v1 *frame = NULL;
 
-struct zwlr_screencopy_manager_v1 *manager;
-struct zwlr_screencopy_frame_v1 *frame;
-
+struct wl_surface* surface = NULL;
+struct wl_compositor* compositor = NULL;
 struct wl_display* display = NULL;   // Wayland Display
 struct wl_registry* registry = NULL; // Wayland Global Registry
 struct wl_output* output = NULL;     // Wayland Output
 struct wl_shm* shm = NULL;           // Wayland Shared Memory
 
+struct xdg_surface * xdg_surface;
+
+uint32_t compositor_id = 0;
 bool buffer_copy_done = false;
+static bool have_linux_dmabuf = false;
 enum screencopy_status status;
 // UTILITY FUNCTIONS -------------------------------------------------------
 
@@ -303,42 +316,25 @@ static void dcX2(uint8_t x, uint8_t dc) {
     int ret;
 	xfer.tx_buf = (uintptr_t)&x; // Uses global xfer struct,
 	xfer.len    = 1;            // as most elements don't change
-	ret = ioctl(eye[0].fd, SPI_IOC_MESSAGE(1), &xfer);
-    if (ret < 0) {
-        printf("Eye 0 ");
-        if (errno == EBADF) {
-            printf("invalid file descriptor\n");
-        } else if (errno == EFAULT) {
-            printf("invalid buffer\n");
-        } else if (errno == EINVAL) {
-            printf("invalid ioctl\n");
-        } else if (errno == EIO) {
-            printf("input/output error\n");
-        } else if (errno == ENOTTY) {
-            printf("inappropriate ioctl for device\n");
-        } else if (errno == EPERM) {
-            printf("operation not permitted\n");
-        } else if (errno == ETIMEDOUT) {
-            printf("ioctl timeout\n");
-        }
-    }
-	ret = ioctl(eye[1].fd, SPI_IOC_MESSAGE(1), &xfer);
-    if (ret < 0) {
-        printf("Eye 1 ");
-        if (errno == EBADF) {
-            printf("invalid file descriptor\n");
-        } else if (errno == EFAULT) {
-            printf("invalid buffer\n");
-        } else if (errno == EINVAL) {
-            printf("invalid ioctl\n");
-        } else if (errno == EIO) {
-            printf("input/output error\n");
-        } else if (errno == ENOTTY) {
-            printf("inappropriate ioctl for device\n");
-        } else if (errno == EPERM) {
-            printf("operation not permitted\n");
-        } else if (errno == ETIMEDOUT) {
-            printf("ioctl timeout\n");
+    for (int i = 0; i < DISPLAY_COUNT; i++) {
+        ret = ioctl(eye[i].fd, SPI_IOC_MESSAGE(1), &xfer);
+        if (ret < 0) {
+            printf("Eye %d ", i);
+            if (errno == EBADF) {
+                printf("invalid file descriptor\n");
+            } else if (errno == EFAULT) {
+                printf("invalid buffer\n");
+            } else if (errno == EINVAL) {
+                printf("invalid ioctl\n");
+            } else if (errno == EIO) {
+                printf("input/output error\n");
+            } else if (errno == ENOTTY) {
+                printf("inappropriate ioctl for device\n");
+            } else if (errno == EPERM) {
+                printf("operation not permitted\n");
+            } else if (errno == ETIMEDOUT) {
+                printf("ioctl timeout\n");
+            }
         }
     }
 }
@@ -362,7 +358,7 @@ static void commandList(const uint8_t *ptr) { // pass in -> command list
 
 double start_time;
 void print_time_elapsed(char *message) {
-#ifdef DEBUG
+#ifdef DEBUG_TIMESTAMPS
     struct timeval tv;
     gettimeofday(&tv, NULL);
     double seconds = (tv.tv_sec - start_time) + (tv.tv_usec / 1000000.0);
@@ -473,6 +469,12 @@ static void deinit(void) {
 	    wl_buffer_destroy(buffer.wl_buffer);
 	    munmap(buffer.data, buffer.stride * buffer.height);     // Memory Unmap
     }
+    if (compositor) {
+        wl_compositor_destroy(compositor);
+    }
+    if (surface) {
+        wl_surface_destroy(surface);
+    }
     if (output) {
         wl_output_destroy(output);
     }
@@ -497,7 +499,7 @@ static void deinit(void) {
     if (chip) {
         gpiod_chip_close(chip);
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < DISPLAY_COUNT; i++) {
         if (eye[i].fd >= 0) {
             close(eye[i].fd);
         }
@@ -599,6 +601,25 @@ void resize_and_convert_to_rgb565(const uint8_t* input, uint16_t* output, int wi
 
 // EVENT HANDLERS ----------------------------------------------------------
 
+static void dmabuf_created(void *data,
+		struct zwp_linux_buffer_params_v1 *params,
+		struct wl_buffer *wl_buffer) {
+	buffer.wl_buffer = wl_buffer;
+
+	zwlr_screencopy_frame_v1_copy(data, buffer.wl_buffer);
+}
+
+static void dmabuf_failed(void *data,
+		struct zwp_linux_buffer_params_v1 *params) {
+	fprintf(stderr, "Failed to create dmabuf\n");
+	exit(EXIT_FAILURE);
+}
+
+static const struct zwp_linux_buffer_params_v1_listener params_listener = {
+	.created = dmabuf_created,
+	.failed = dmabuf_failed,
+};
+
 static void registry_add(void *data, struct wl_registry *registry, uint32_t id, const char *interface, uint32_t version) {
 #ifdef DEBUG
     printf("Loading Interface: %s\n", interface);
@@ -606,6 +627,10 @@ static void registry_add(void *data, struct wl_registry *registry, uint32_t id, 
 	if (strcmp(interface, wl_output_interface.name) == 0 && output == NULL) {
 		output = wl_registry_bind(registry, id, &wl_output_interface, 3);
         return;
+    }
+    if (strcmp(interface, wl_compositor_interface.name) == 0) {
+        compositor = wl_registry_bind(registry, id, &wl_compositor_interface, 4);
+        compositor_id = id;
     }
     if (strcmp(interface, wl_shm_interface.name) == 0) {
 		shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
@@ -643,6 +668,12 @@ static void output_handle_done(void *data, struct wl_output *wl_output) {
 static void output_handle_scale(void *data, struct wl_output *wl_output, int32_t factor) {
 }
 
+static void frame_handle_buffer_done(void* data,
+			      struct zwlr_screencopy_frame_v1* frame)
+{
+    printf("Buffer Done");
+}
+
 static void frame_handle_buffer(void* data,
 			      struct zwlr_screencopy_frame_v1* frame,
 			      enum wl_shm_format format, uint32_t width,
@@ -651,15 +682,23 @@ static void frame_handle_buffer(void* data,
 	buffer.width = width;
 	buffer.height = height;
 	buffer.stride = stride;
+#ifdef DEBUG
+    printf("Buffer: format: %d, width: %d, height: %d, stride: %d\n", format, width, height, stride);
+#endif
 
 	// Make sure the buffer is not allocated
 	assert(!buffer.wl_buffer);
+    // TODO: Does this need to be moved to main?
 	buffer.wl_buffer = create_shm_buffer(format, width, height, stride, &buffer.data);
 	if (buffer.wl_buffer == NULL) {
 		err(9, "failed to create buffer\n");
 	}
 
+#ifdef USE_DAMAGE
+    zwlr_screencopy_frame_v1_copy_with_damage(frame, buffer.wl_buffer);
+#else
     zwlr_screencopy_frame_v1_copy(frame, buffer.wl_buffer);
+#endif
 }
 
 static void frame_handle_flags(void* data,
@@ -685,11 +724,7 @@ static void frame_handle_linux_dmabuf(void* data,
 			      struct zwlr_screencopy_frame_v1* frame,
 			      uint32_t format, uint32_t width, uint32_t height)
 {
-}
 
-static void frame_handle_buffer_done(void* data,
-			      struct zwlr_screencopy_frame_v1* frame)
-{
 }
 
 static void frame_handle_damage(void* data,
@@ -697,7 +732,11 @@ static void frame_handle_damage(void* data,
 			      uint32_t x, uint32_t y,
 			      uint32_t width, uint32_t height)
 {
-
+    // This is where we need to draw to the screens. However, bicubic filter may cause artifacts to appear.
+    // Will need to experiment with different filters. Ideally, we can have it pre-scaled to the display size.
+#ifdef DEBUG
+    printf("Damage: x: %d, y: %d, width: %d, height: %d\n", x, y, width, height);
+#endif
 	//wv_buffer_damage_rect(self->front, x, y, width, height);
 }
 
@@ -739,6 +778,9 @@ int main(int argc, char *argv[]) {
             break;
 		}
 	}
+
+    // Display count should only be 1 or 2
+    assert(DISPLAY_COUNT == 1 || DISPLAY_COUNT == 2);
 
 	if(!bitrate) bitrate = screen[screenType].bitrate;
 
@@ -788,16 +830,18 @@ int main(int argc, char *argv[]) {
 
 	if((eye[0].fd = open("/dev/spidev0.0", O_WRONLY|O_NONBLOCK)) < 0)
 		err(6, "Can't open spidev0.0, is SPI enabled?");
-	if((eye[1].fd = open("/dev/spidev1.2", O_WRONLY|O_NONBLOCK)) < 0)
-		err(7, "Can't open spidev1.2, is spi1-3cs overlay enabled?");
+    if (DISPLAY_COUNT > 1) {
+        if((eye[1].fd = open("/dev/spidev1.2", O_WRONLY|O_NONBLOCK)) < 0)
+            err(7, "Can't open spidev1.2, is spi1-3cs overlay enabled?");
+    }
 
 	xfer.speed_hz = bitrate;
 	uint8_t  mode = SPI_MODE_0;
-	for(i=0; i<2; i++) {
+	for(i=0; i<DISPLAY_COUNT; i++) {
 		ioctl(eye[i].fd, SPI_IOC_WR_MODE, &mode);
 		ioctl(eye[i].fd, SPI_IOC_WR_MAX_SPEED_HZ, &bitrate);
 		memcpy(&eye[i].xfer, &xfer, sizeof(xfer));
-		for(j=0; j<2; j++) {
+		for(j=0; j<2; j++) { // Once per buffer
 			if(NULL == (eye[i].buf[j] = (uint16_t *)malloc(
 			  screen[screenType].width *
 			  screen[screenType].height * sizeof(uint16_t)))) {
@@ -868,6 +912,10 @@ int main(int argc, char *argv[]) {
         err(12, "Compositor doesn't support wlr-screencopy-unstable-v1. Exiting.");
     }
 
+    if (!compositor) {
+        err(13, "Compositor is missing wl_compositor\n");
+    }
+
 	if (output == NULL) {
 		err(13, "no output available\n");
 	}
@@ -912,10 +960,13 @@ int main(int argc, char *argv[]) {
 	}
 
 	// Initialize SPI transfer threads and synchronization barrier
-	pthread_barrier_init(&barr, NULL, 3);
-	uint8_t aa = 0, bb = 1;
+	pthread_barrier_init(&barr, NULL, DISPLAY_COUNT + 1);  // Main thread plus 1 for each display
+	uint8_t aa = 0;
 	pthread_create(&eye[0].thread, NULL, spiThreadFunc, &aa);
-	pthread_create(&eye[1].thread, NULL, spiThreadFunc, &bb);
+    if (DISPLAY_COUNT > 1) {
+        uint8_t bb = 1;
+	    pthread_create(&eye[1].thread, NULL, spiThreadFunc, &bb);
+    }
 
 	// MAIN LOOP -------------------------------------------------------
 
@@ -925,6 +976,9 @@ int main(int argc, char *argv[]) {
 	          w = screen[screenType].width,
 	          h = screen[screenType].height;
 	for(;;) {
+        buffer_copy_done = false;
+        wl_display_flush(display);
+        wl_display_roundtrip(display);
         while (!buffer_copy_done && wl_display_dispatch(display) != -1) {
             // Wait for buffer copy to finish
         }
@@ -936,18 +990,24 @@ int main(int argc, char *argv[]) {
 		// Crop & transfer rects to eye buffers, flip hi/lo bytes
 		j    = 1 - bufIdx; // Render to 'back' buffer
 		src0 = &pixelBuf[offset0];
-		src1 = &pixelBuf[offset1];
 		dst0 = eye[0].buf[j];
-		dst1 = eye[1].buf[j];
+        if (DISPLAY_COUNT > 1) {
+    		src1 = &pixelBuf[offset1];
+		    dst1 = eye[1].buf[j];
+        }
 		for(y=0; y<h; y++) {
 			for(x=0; x<w; x++) {
 				dst0[x] = __builtin_bswap16(src0[x]);
-				dst1[x] = __builtin_bswap16(src1[x]);
+                if (DISPLAY_COUNT > 1) {
+		    		dst1[x] = __builtin_bswap16(src1[x]);
+                }
 			}
 			src0 += width;
-			src1 += width;
 			dst0 += w;
-			dst1 += w;
+            if (DISPLAY_COUNT > 1) {
+	    		src1 += width;
+    			dst1 += w;
+            }
 		}
         print_time_elapsed("Crop Rects");
 
@@ -988,7 +1048,6 @@ int main(int argc, char *argv[]) {
 				prevTime = t;
 			}
 		}
-        print_time_elapsed("Show FPS");
 	}
 
     deinit();
